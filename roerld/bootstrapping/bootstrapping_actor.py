@@ -6,6 +6,7 @@ import ray
 import tensorflow as tf
 
 from roerld.config.experiment_config import ExperimentConfig
+from roerld.envs.adapters.flatten_dict_adapter import FlattenDictAdapter
 from roerld.execution.rollouts.rollout_worker import RolloutWorker
 from roerld.learning_actors.learning_actor import LearningActor
 
@@ -29,6 +30,12 @@ class BootstrappingActor:
         self.kwargs = kwargs
 
         self.environment = environment_factory()
+
+        if any([type(subspace) == gym.spaces.Dict for name, subspace in
+                self.environment.observation_space.spaces.items()]):
+            print("Using dict space adapter.")
+            self.environment = FlattenDictAdapter(self.environment)
+
         self.learning_actor = learning_actor_factory(self.environment.action_space)
         self.rollout_worker_params = {
             "environment": self.environment,
@@ -49,7 +56,8 @@ class BootstrappingActor:
             extra_info = {
                 "rollout.environment": self.environment,
             }
-            experience, videos, episode_starts, diagnostics = self.rollout_worker.training_rollout(1, False, passthrough_extra_info=extra_info)
+            experience, videos, episode_starts, diagnostics = self.rollout_worker.training_rollout(1, False,
+                                                                                                   passthrough_extra_info=extra_info)
             experiences.append(experience)
             collected_samples += len(experience[list(experience.keys())[0]])
         return experiences

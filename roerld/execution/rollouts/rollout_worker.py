@@ -30,21 +30,27 @@ class RolloutWorker:
         self.actor = actor
         self.render_every_n_frames = render_every_n_frames
 
+        self.env_supports_variable_render = hasattr(self.env, "render_image")
+
         self.is_subsampling = issubclass(type(self.env), SubsamplingEnv)
         if self.is_subsampling:
             print("Rollout worker is subsampling the environment.")
 
-    def training_rollout(self, num_episodes, render_videos, passthrough_extra_info=None):
+    def training_rollout(self, num_episodes, render_videos, passthrough_extra_info=None, fully_random=False):
         if passthrough_extra_info is None:
             passthrough_extra_info = {}
-        return self._rollout(num_episodes, False, render_videos, passthrough_extra_info)
+        #print("Starting Training Rollout")
+        return self._rollout(num_episodes, False, render_videos, passthrough_extra_info, fully_random)
 
     def evaluation_rollout(self, num_episodes, render_videos, passthrough_extra_info=None):
         if passthrough_extra_info is None:
             passthrough_extra_info = {}
+        #print("Starting Evaluation Rollout")
         return self._rollout(num_episodes, True, render_videos, passthrough_extra_info)
 
-    def _rollout(self, num_episodes, is_evaluation, render_videos, extra_info=None):
+    def _rollout(self, num_episodes, is_evaluation, render_videos, extra_info=None, fully_random=False):
+        #print(f"Rollout Perform:  ne={num_episodes}, info={extra_info}, is_eval={is_evaluation}, "
+        #      f"render_videos={render_videos}, fully_random={fully_random}")
         if extra_info is None:
             extra_info = {}
         start_time = time.perf_counter()
@@ -115,7 +121,10 @@ class RolloutWorker:
                 previous_observation = observation
 
                 action_sel = time.perf_counter()
-                action = self.actor.choose_action(observation, i, is_evaluation, extra_info)
+                if not fully_random:
+                    action = self.actor.choose_action(observation, i, is_evaluation, extra_info)
+                else:
+                    action = self.env.action_space.sample()
                 action = np.clip(action, a_min=self.action_clip_low, a_max=self.action_clip_high)
                 action_selection_time += time.perf_counter() - action_sel
 
@@ -159,8 +168,14 @@ class RolloutWorker:
                         assert self.eval_video_height is not None
                         additional_kwargs.update({"width": self.eval_video_width,
                                                   "height": self.eval_video_height})
-                    episode_video.append(self.env.render(mode=self.eval_video_render_mode,
-                                                         **additional_kwargs))
+                    image = None
+                    if self.env_supports_variable_render:
+                        image = self.env.render_image(mode=self.eval_video_render_mode,
+                                        **additional_kwargs)
+                    else:
+                        image = self.env.render(mode=self.eval_video_render_mode,
+                                                         **additional_kwargs)
+                    episode_video.append(image)
                 rendering_time += time.perf_counter() - render_t
                 if done:
                     break

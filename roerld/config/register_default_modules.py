@@ -126,6 +126,7 @@ def _register_distributed_update_step_runners():
             max_episode_length=pipeline_section.key("max_episode_length"),
             checkpoint_interval=pipeline_section.key("model_save_frequency"),
             min_bellman_update_batches_per_epoch=pipeline_section.key("min_bellman_update_batches_per_epoch"),
+            max_bellman_update_batches_per_epoch=pipeline_section.optional_key("max_bellman_update_batches_per_epoch", None),
             seed=experiment_config.key("general_config.seed"),
             num_eval_episodes_per_epoch=pipeline_section.key("evaluation.num_eval_episodes_per_epoch"),
             save_eval_videos=pipeline_section.key("evaluation.save_videos"),

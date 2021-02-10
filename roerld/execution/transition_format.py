@@ -55,6 +55,7 @@ class TransitionFormat:
                 raise ValueError("'action' is a reserved key. To use an environment which has a key"
                                  "'action' in its observation, the creation of an adapter class is necessary.")
             if type(subspace) != gym.spaces.Box:
+                print("Observation space was:", str(observation_space))
                 raise ValueError("This class works with an observation space of Box spaces inside"
                                  "a dict space. To use differently structured environments an adapter class "
                                  "is necessary.")

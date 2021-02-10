@@ -5,6 +5,7 @@ import ray
 import tensorflow as tf
 
 from roerld.config.experiment_config import ExperimentConfig
+from roerld.envs.adapters.flatten_dict_adapter import FlattenDictAdapter
 from roerld.execution.distributed_update_step_algorithm import DistributedUpdateStepAlgorithm
 from roerld.learning_actors.learning_actor import LearningActor
 
@@ -38,6 +39,11 @@ class RolloutActor:
         self.coordinator_actor = coordinator_actor
 
         self.environment = environment_factory()
+
+        if any([type(subspace) == gym.spaces.Dict for name, subspace in self.environment.observation_space.spaces.items()]):
+            print("Using dict space adapter.")
+            self.environment = FlattenDictAdapter(self.environment)
+
         self.algorithm, self.learning_actor = algorithm_factory(self.environment.action_space)
         self.rollout_worker_params = {
             "environment": self.environment,
@@ -57,7 +63,10 @@ class RolloutActor:
         self.algorithm.setup(worker_control=worker_control, worker_specific_kwargs=self.kwargs)
         self.rollout_worker = RolloutWorker(actor=self.learning_actor, **self.rollout_worker_params)
 
-    def rollout(self, num_episodes, weights, info, is_evaluation, render_eval_videos):
+    def rollout(self, num_episodes, weights, info, is_evaluation, render_eval_videos, fully_random=False):
+        #print(f"Rollout Request:  ne={num_episodes}, info={info}, is_eval={is_evaluation}, "
+        #      f"render_videos={render_eval_videos}, fully_random={fully_random}")
+
         self.algorithm.update_weights(weights)
 
         epoch = ray.get(self.coordinator_actor.epoch.remote())
@@ -68,11 +77,13 @@ class RolloutActor:
 
         # unpack manually here to maintain compatibility to lower python versions
         if is_evaluation:
+            assert not fully_random
             experience, videos, episode_starts, diagnostics = \
                 self.rollout_worker.evaluation_rollout(num_episodes, render_eval_videos, extra_info)
         else:
             experience, videos, episode_starts, diagnostics = \
-                self.rollout_worker.training_rollout(num_episodes, render_eval_videos, extra_info)
+                self.rollout_worker.training_rollout(num_episodes, render_eval_videos, extra_info,
+                                                     fully_random=fully_random)
 
         return experience, videos, episode_starts, diagnostics, info
 

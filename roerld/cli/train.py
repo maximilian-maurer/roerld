@@ -5,7 +5,13 @@ import sys
 import ray
 from roerld.cli.config_files import load_and_merge_configs
 from roerld.config import make_distributed_update_step_runner
-from roerld.config.experiment_config import ExperimentConfig
+from roerld.config.experiment_config import ExperimentConfig, ExperimentConfigView
+
+
+def _determine_training_length(args, experiment_config: ExperimentConfigView):
+    if args.epochs is not None:
+        return args.epochs
+    return experiment_config.optional_key("general_config.epochs", 1e20)
 
 
 def train_cli(argv, actor_setup_function):
@@ -19,7 +25,7 @@ def train_cli(argv, actor_setup_function):
     parser.add_argument("--epochs",
                         required=False,
                         type=int,
-                        default=1e12,
+                        default=None,
                         help="Number of epochs to train for.")
     parser.add_argument("--tag",
                         required=True,
@@ -54,12 +60,13 @@ def train_cli(argv, actor_setup_function):
             config_dict["general_config"]["experiment_tag"] = config_dict["general_config"]["experiment_tag"] + args.tag
 
         experiment_config = ExperimentConfig.view(config_dict)
+        epochs = _determine_training_length(args, experiment_config)
 
         pipeline = make_distributed_update_step_runner(
             experiment_config.section("pipeline"),
             experiment_config,
             actor_setup_function,
-            epochs=args.epochs,
+            epochs=epochs,
             restore_from_checkpoint_path=None,
         )
         pipeline.run()
@@ -76,12 +83,13 @@ def train_cli(argv, actor_setup_function):
             config_dict["general_config"]["experiment_tag"] = config_dict["general_config"]["experiment_tag"] + args.tag
 
         experiment_config = ExperimentConfig.view(config_dict)
+        epochs = _determine_training_length(args, experiment_config)
 
         pipeline = make_distributed_update_step_runner(
             experiment_config.section("pipeline"),
             experiment_config,
             actor_setup_function,
-            epochs=args.epochs,
+            epochs=epochs,
             restore_from_checkpoint_path=args.restore_from_checkpoint,
         )
         pipeline.run()

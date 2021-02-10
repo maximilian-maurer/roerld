@@ -11,6 +11,7 @@ from roerld.qtopt.cross_entropy_method import cross_entropy_method_normal
 from roerld.qtopt.workers.batch_remapping import remap_keys_observations_in_batch_with_actions, \
     remap_keys_observations_in_batch_without_actions
 from roerld.qtopt.workers.bellman_updater_worker import BellmanUpdaterWorker
+from roerld.qtopt.workers.bellman_updater_worker_gpu import BellmanUpdaterWorkerGPU
 
 
 class QtOpt(DistributedUpdateStepAlgorithm):
@@ -85,24 +86,48 @@ class QtOpt(DistributedUpdateStepAlgorithm):
         self.action_clip_low = worker_control.action_space().low
         self.action_clip_high = worker_control.action_space().high
 
-        self.bellman_updater_worker = BellmanUpdaterWorker(
-            input_spec=worker_control.input_spec().to_legacy_format(),
-            q_network_1=self.q_network_1,
-            q_network_2=self.q_network_2,
-            gamma=self.gamma,
-            cem_iterations=self.cem_iterations,
-            cem_sample_count=self.cem_sample_count,
-            cem_elite_sample_count=self.cem_elite_sample_count,
-            cem_initial_mean=self.cem_initial_mean,
-            cem_initial_std=self.cem_initial_std,
+        gpus_available = len(tf.config.experimental.list_physical_devices("GPU")) > 0
 
-            action_clip_low=self.action_clip_low,
-            action_clip_high=self.action_clip_high,
-            max_optimizer_batch_size=self.max_bellman_updater_optimizer_batch_size,
+        if gpus_available:
+            print("Worker has GPU available.")
 
-            clip_q_target_max=self.clip_q_target_max,
-            clip_q_target_min=self.clip_q_target_min
-        )
+            self.bellman_updater_worker = BellmanUpdaterWorkerGPU(
+                input_spec=worker_control.input_spec().to_legacy_format(),
+                q_network_1=self.q_network_1,
+                q_network_2=self.q_network_2,
+                gamma=self.gamma,
+                cem_iterations=self.cem_iterations,
+                cem_sample_count=self.cem_sample_count,
+                cem_elite_sample_count=self.cem_elite_sample_count,
+                cem_initial_mean=self.cem_initial_mean,
+                cem_initial_std=self.cem_initial_std,
+
+                action_clip_low=self.action_clip_low,
+                action_clip_high=self.action_clip_high,
+                max_optimizer_batch_size=self.max_bellman_updater_optimizer_batch_size,
+
+                clip_q_target_max=self.clip_q_target_max,
+                clip_q_target_min=self.clip_q_target_min
+            )
+        else:
+            self.bellman_updater_worker = BellmanUpdaterWorker(
+                input_spec=worker_control.input_spec().to_legacy_format(),
+                q_network_1=self.q_network_1,
+                q_network_2=self.q_network_2,
+                gamma=self.gamma,
+                cem_iterations=self.cem_iterations,
+                cem_sample_count=self.cem_sample_count,
+                cem_elite_sample_count=self.cem_elite_sample_count,
+                cem_initial_mean=self.cem_initial_mean,
+                cem_initial_std=self.cem_initial_std,
+
+                action_clip_low=self.action_clip_low,
+                action_clip_high=self.action_clip_high,
+                max_optimizer_batch_size=self.max_bellman_updater_optimizer_batch_size,
+
+                clip_q_target_max=self.clip_q_target_max,
+                clip_q_target_min=self.clip_q_target_min
+            )
 
         if self.optimizer_name == "adam":
             self.q_t0_optimizer = tf.compat.v2.keras.optimizers.Adam(**self.optimizer_kwargs)

@@ -78,6 +78,7 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
                  max_episode_length: int,
                  checkpoint_interval: int,
                  min_bellman_update_batches_per_epoch: int,
+                 max_bellman_update_batches_per_epoch: int,
                  seed: int,
                  num_eval_episodes_per_epoch: int,
                  save_eval_videos: bool,
@@ -202,6 +203,7 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
 
         self.checkpoint_interval = checkpoint_interval
         self.min_bellman_update_batches_per_epoch = min_bellman_update_batches_per_epoch
+        self.max_bellman_update_batches_per_epoch = max_bellman_update_batches_per_epoch if max_bellman_update_batches_per_epoch is not None else np.inf
         self.seed = seed
         self.num_eval_episodes_per_epoch = num_eval_episodes_per_epoch
         self.save_eval_videos = save_eval_videos
@@ -217,6 +219,7 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
         assert min_bellman_update_batches_per_epoch >= 0
         assert num_eval_episodes_per_epoch > 0
         assert eval_interval > 0
+        assert self.max_bellman_update_batches_per_epoch >= self.min_bellman_update_batches_per_epoch
 
         # keys set via the configuration
         self.algorithm = None
@@ -260,6 +263,10 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
     def _setup(self):
         self._ensure_output_folders_exist()
         self.tb_writer = tf.summary.create_file_writer(logdir=self.output_path)
+
+        if os.path.islink("latest_run"):
+            os.unlink("latest_run")
+        os.symlink(self.output_path, "latest_run", target_is_directory=True)
 
         # Save config to the experiment folder
 
@@ -338,12 +345,11 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
 
             if float(current_size) / max_buffer_size < 0.1:
                 # there are no offline replay actors, which means everything is done on-policy.
-                print("Performing initial onpolicy buffer fill (not random exploration).")
+                print("Performing initial onpolicy buffer fill.")
                 self.rollout_manager.start_of_epoch(0, self.weights)
 
-                # todo this should actually perform random initial exploration
-                for _ in range(len(self.rollout_actors) * 3):
-                    self.rollout_manager.manually_schedule_training_rollout()
+                for _ in range(len(self.rollout_actors) * 100):
+                    self.rollout_manager.manually_schedule_training_rollout(fully_random=True)
                 pending_rollout_futures = self.rollout_manager.pending_futures()
                 wait_all(pending_rollout_futures)
                 for idx, f in enumerate(pending_rollout_futures):
@@ -364,7 +370,7 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
                 print(f"Offline buffer has {samples} samples in it ({round((samples / max_buffer_size) * 100, 2)}%)")
 
         print("Populating training buffer, waiting for initial batches to be processed")
-        for i in range(20):
+        for i in range(50):
             print(f"Initial Buffer Fill #{i}")
             wait_all([worker.update_step.remote(self.distributed_update_args) for worker in self.bellman_update_actors])
 
@@ -525,12 +531,14 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
                         bellman_updater = task_assignments[ready_future]
                         results, diagnostics = ray.get(ready_future)
                         distributed_update_results.append(results)
-
-                        new_future = bellman_updater.update_step.remote(self.distributed_update_args)
-                        del task_assignments[ready_future]
-                        task_assignments[new_future] = bellman_updater
-                        bellman_updater_diagnostics.append(diagnostics)
                         this_epoch_bellman_updates += 1
+                        del task_assignments[ready_future]
+
+                        if this_epoch_bellman_updates < self.max_bellman_update_batches_per_epoch:
+                            # todo: this over-schedules by the worker count
+                            new_future = bellman_updater.update_step.remote(self.distributed_update_args)
+                            task_assignments[new_future] = bellman_updater
+                            bellman_updater_diagnostics.append(diagnostics)
 
                 time_bellman_updater_stall = time.perf_counter() - bellman_updater_stall_start \
                     if had_bellman_updater_stall else 0
@@ -690,6 +698,12 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
                 "Episode Return (From Environment Reward)": [np.sum(e["rewards"]) for e in as_episodes],
                 "Episode Length": [len(e["actions"]) for e in as_episodes]
             }
+
+            if len(as_episodes) > 0 and len(as_episodes[0]["infos"]) > 0 and "is_success" in as_episodes[0]["infos"][0]:
+                success_rate = np.sum([np.max([e["infos"][i]["is_success"] for i in range(len(e["infos"]))])
+                                       for e in as_episodes]) / len(as_episodes)
+                additional_info["Success Rate"] = success_rate
+
             info.update(aggregate_diagnostics([additional_info]))
 
             print(

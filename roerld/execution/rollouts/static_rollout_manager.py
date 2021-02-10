@@ -10,8 +10,10 @@ class StaticRolloutManager:
 
                  render_every_n_training_rollouts: int = 0):
         self.runner = runner
-        self.max_training_rollouts_per_epoch = min_training_rollouts_per_epoch
-        self.min_training_rollouts_per_epoch = max_training_rollouts_per_epoch
+        self.min_training_rollouts_per_epoch = min_training_rollouts_per_epoch
+        self.max_training_rollouts_per_epoch = max_training_rollouts_per_epoch
+
+        assert self.min_training_rollouts_per_epoch <= self.max_training_rollouts_per_epoch
 
         self.rollout_actors = workers
         self.task_assignments = {}
@@ -25,6 +27,7 @@ class StaticRolloutManager:
 
         self.render_every_n_training_rollouts = render_every_n_training_rollouts
         self.total_training_rollouts = 0
+        self.training_rollouts_arrived_this_epoch = 0
 
     def enable_training_rollouts(self):
         self.training_rollouts_enabled = True
@@ -37,6 +40,7 @@ class StaticRolloutManager:
         self.onpolicy_rollout_weights = onpolicy_rollout_weights
         self.epoch_index = epoch_index
         self._training_rollouts_started_this_epoch = 0
+        self.training_rollouts_arrived_this_epoch = 0
 
         if not self.training_rollouts_enabled:
             return
@@ -78,7 +82,7 @@ class StaticRolloutManager:
         self.task_assignments[rollout_future] = evaluation_worker
         return [rollout_future]
 
-    def manually_schedule_training_rollout(self):
+    def manually_schedule_training_rollout(self, fully_random=False):
         # select a worker
         tasks_per_worker = {w: [t for t, iw in self.task_assignments.items() if iw == w] for w in self.rollout_actors}
         idle_workers = [w for w, t in tasks_per_worker.items() if len(t) == 0]
@@ -93,7 +97,8 @@ class StaticRolloutManager:
                                                       self.onpolicy_rollout_weights,
                                                       {"epoch": self.epoch_index},
                                                       False,
-                                                      self._render_video_next_training_rollout())
+                                                      self._render_video_next_training_rollout(),
+                                                      fully_random=fully_random)
         self._training_rollouts_started_this_epoch += 1
         self.total_training_rollouts += 1
         self.task_assignments[new_future] = evaluation_worker
@@ -108,6 +113,9 @@ class StaticRolloutManager:
         else:
             # print("Received training rollout")
             self.runner.receive_training_rollout(future)
+
+        self.training_rollouts_arrived_this_epoch += 1
+        #print(f"Training future arrived {self.training_rollouts_arrived_this_epoch}")
 
         if self.training_rollouts_enabled and \
                 self._training_rollouts_started_this_epoch < self.max_training_rollouts_per_epoch:
@@ -126,8 +134,9 @@ class StaticRolloutManager:
                                                                 self.onpolicy_rollout_weights,
                                                                 {"epoch": self.epoch_index},
                                                                 False,
-                                                                False)
+                                                                self._render_video_next_training_rollout())
                 self._training_rollouts_started_this_epoch += 1
+                self.total_training_rollouts += 1
                 self.task_assignments[new_future] = corresponding_actor
 
         del self.task_assignments[future]
@@ -137,6 +146,9 @@ class StaticRolloutManager:
         return self._training_rollouts_started_this_epoch
 
     def needs_stall(self):
+        if self.training_rollouts_enabled and \
+                self.training_rollouts_arrived_this_epoch < self.min_training_rollouts_per_epoch:
+            return True
         if len(self.pending_eval_futures) <= len(self.rollout_actors):
             return False
         return True
