@@ -12,6 +12,9 @@ from roerld.config.resolution.worker_group_resolution import resolve_worker_grou
 from roerld.data_handling.json_driven_data_source import JsonDrivenDataSource
 from roerld.data_handling.tf_data_source import TFDataSource
 from roerld.execution.control.worker_control import WorkerControl
+from roerld.execution.ratios.absolute_limiter import AbsoluteLimiter
+from roerld.execution.ratios.moving_average_limiter import MovingAverageLimiter
+from roerld.execution.rollouts import StaticRolloutManager
 from roerld.execution.transition_format import TransitionFormat
 from roerld.learning_actors.random.gaussian_random import GaussianRandomLearningActor
 from roerld.learning_actors.random.random_from_action_space import RandomFromActionSpaceLearningActor
@@ -28,6 +31,24 @@ from roerld.utils.onpolicy_fraction_strategy.onpolicy_fraction_strategy_resolver
 import numpy as np
 
 
+def _make_limiter(config_section):
+    view = ExperimentConfig.view(config_section)
+
+    if view.key("name") == "absolute_limiter":
+        return AbsoluteLimiter(
+            minimum=view.key("minimum"),
+            maximum=view.key("maximum")
+        )
+    elif view.key("name") == "moving_average_limiter":
+        return MovingAverageLimiter(
+            minimum=view.key("minimum"),
+            maximum=view.key("maximum"),
+            window_size=view.key("window_size")
+        )
+    else:
+        raise ValueError(f"Can't make limiter '{view.key('name')}'")
+
+
 def _register_distributed_update_step_runners():
     from roerld.execution.runners.distributed_update_step_pipeline_runner import DistributedUpdateStepPipelineRunner
 
@@ -41,6 +62,15 @@ def _register_distributed_update_step_runners():
             config = ExperimentConfig.view(experiment_config.section("algorithm"))
             return make_distributed_update_step_algorithm(config)
 
+        def _rollout_manager_factory(pipeline):
+            assert experiment_config.key("rollout_manager.name") == "static_rollouts"
+            manager = StaticRolloutManager(
+                pipeline,
+                [_make_limiter(l) for l in experiment_config.optional_key("rollout_manager.training_runs_started_limiters", [])],
+                [_make_limiter(l) for l in experiment_config.optional_key("rollout_manager.training_runs_returned_limiters", [])],
+                render_every_n_training_rollouts=experiment_config.key("rollout_manager.render_every_n_training_rollouts"))
+            return manager
+
         def _replay_buffer_factory_curry(config_section):
             def _replay_buffer_factory(transition_format):
                 return make_replay_buffer(config_section, transition_format)
@@ -52,6 +82,13 @@ def _register_distributed_update_step_runners():
 
         experiment_config = ExperimentConfig.view(experiment_config)
         pipeline_section = experiment_config.section("pipeline")
+        # backwards compatibility
+        if pipeline_section.has_key("min_bellman_update_batches_per_epoch"):
+            raise ValueError("Warning: The pipeline.min_bellman_update_batches_per_epoch key does no longer exist. "
+                             "It has to be migrated to update_steps_started_per_epoch_limiters")
+        if pipeline_section.has_key("max_bellman_update_batches_per_epoch"):
+            raise ValueError("Warning: The pipeline.max_bellman_update_batches_per_epoch key does no longer exist. "
+                             "It has to be migrated to update_steps_started_per_epoch_limiters")
 
         # todo this addresses aspects for which there is no proper resolution of what should be created yet
         assert pipeline_section.key("evaluation.name") == "basic"
@@ -70,12 +107,13 @@ def _register_distributed_update_step_runners():
             def _make_this_preprocessing_chain():
                 preprocessor_configs = local_chain["preprocessors"]
                 preprocessors = [make_episode_preprocessor(config) for config in preprocessor_configs]
-    
+
                 if len(preprocessors) == 0:
                     preprocessors = [PassthroughPreprocessor()]
-    
+
                 chain_instance = PreprocessingChain(preprocessors)
                 return chain_instance
+
             return _make_this_preprocessing_chain
 
         for chain in preprocessing_chains:
@@ -86,6 +124,16 @@ def _register_distributed_update_step_runners():
             chains_out.append((sources, sink, factory, workers))
 
         preprocessing_workers = resolve_worker_groups(experiment_config.section("workers.preprocessing_workers"))
+
+        log_path = resolve_path(experiment_config,
+                                path_kind=PathKind.NewLog,
+                                categories=[])
+        if "path_prefix" in kwargs and kwargs["path_prefix"] is not None:
+            log_path = os.path.join(kwargs["path_prefix"], log_path)
+        else:
+            log_path = os.path.join("logs", log_path)
+        if "path_prefix" in kwargs:
+            del kwargs["path_prefix"]
 
         runner = DistributedUpdateStepPipelineRunner(
             algorithm_factory=_algorithm_factory,
@@ -120,13 +168,11 @@ def _register_distributed_update_step_runners():
 
             write_checkpoint_callback=_write_checkpoint_callback,
 
-            log_path=resolve_path(experiment_config,
-                                  path_kind=PathKind.NewLog,
-                                  categories=[]),
-            max_episode_length=pipeline_section.key("max_episode_length"),
+            log_path=log_path,
+            max_episode_length=pipeline_section.optional_key("max_episode_length", None),
             checkpoint_interval=pipeline_section.key("model_save_frequency"),
-            min_bellman_update_batches_per_epoch=pipeline_section.key("min_bellman_update_batches_per_epoch"),
-            max_bellman_update_batches_per_epoch=pipeline_section.optional_key("max_bellman_update_batches_per_epoch", None),
+            update_steps_started_per_epoch_limiters=[_make_limiter(s)
+                                                     for s in pipeline_section.optional_key("update_steps_started_per_epoch_limiters", [])],
             seed=experiment_config.key("general_config.seed"),
             num_eval_episodes_per_epoch=pipeline_section.key("evaluation.num_eval_episodes_per_epoch"),
             save_eval_videos=pipeline_section.key("evaluation.save_videos"),
@@ -139,7 +185,12 @@ def _register_distributed_update_step_runners():
             preprocessing_workers=preprocessing_workers,
             preprocessing_chains=chains_out,
 
+            rollout_manager_factory=_rollout_manager_factory,
+            
             experiment_config=experiment_config,
+
+            initial_bellman_update_count=pipeline_section.key("initial_bellman_update_count"),
+            initial_rollout_count=pipeline_section.key("initial_rollout_count"),
 
             **kwargs
         )

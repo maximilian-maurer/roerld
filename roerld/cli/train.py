@@ -27,6 +27,11 @@ def train_cli(argv, actor_setup_function):
                         type=int,
                         default=None,
                         help="Number of epochs to train for.")
+    parser.add_argument("--path-prefix",
+                        required=False,
+                        type=str,
+                        default=None,
+                        help="Prefix for the output directory")
     parser.add_argument("--tag",
                         required=True,
                         type=str,
@@ -68,6 +73,7 @@ def train_cli(argv, actor_setup_function):
             actor_setup_function,
             epochs=epochs,
             restore_from_checkpoint_path=None,
+            path_prefix=args.path_prefix
         )
         pipeline.run()
     elif args.restore_from_checkpoint is not None:
@@ -91,6 +97,7 @@ def train_cli(argv, actor_setup_function):
             actor_setup_function,
             epochs=epochs,
             restore_from_checkpoint_path=args.restore_from_checkpoint,
+            path_prefix=args.path_prefix
         )
         pipeline.run()
     else:

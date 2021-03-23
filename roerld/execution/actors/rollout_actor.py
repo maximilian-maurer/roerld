@@ -3,9 +3,11 @@ from typing import Callable, Tuple
 import gym.spaces
 import ray
 import tensorflow as tf
+import numpy as np
 
 from roerld.config.experiment_config import ExperimentConfig
 from roerld.envs.adapters.flatten_dict_adapter import FlattenDictAdapter
+from roerld.envs.adapters.dict_env_adapter import DictEnvAdapter
 from roerld.execution.distributed_update_step_algorithm import DistributedUpdateStepAlgorithm
 from roerld.learning_actors.learning_actor import LearningActor
 
@@ -23,7 +25,11 @@ class RolloutActor:
                  **kwargs):
         actor_setup_function()
 
-        # todo seed handling
+        self.seed = seed
+        if self.seed is not None:
+            tf.random.set_seed(self.seed)
+            np.random.seed(self.seed)
+            print(f"Rollout Worker started up with seed {self.seed}")
 
         self.rollout_config = ExperimentConfig.view(rollout_config)
 
@@ -39,6 +45,12 @@ class RolloutActor:
         self.coordinator_actor = coordinator_actor
 
         self.environment = environment_factory()
+
+        if isinstance(self.environment.observation_space, gym.spaces.Box):
+            self.environment = DictEnvAdapter(self.environment)
+            print("Wrapping environment with gym.Box observation space into DictEnvAdapter, new observation is now 'observation'")
+
+        self.reproducer_seed = self.environment.seed(self.seed)
 
         if any([type(subspace) == gym.spaces.Dict for name, subspace in self.environment.observation_space.spaces.items()]):
             print("Using dict space adapter.")
@@ -56,6 +68,9 @@ class RolloutActor:
         }
 
         self.rollout_worker = None
+
+    def reproducer_seeds(self):
+        return self.reproducer_seed
 
     def initialize(self, worker_control):
         from roerld.execution.rollouts.rollout_worker import RolloutWorker

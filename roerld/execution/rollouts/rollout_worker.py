@@ -23,6 +23,17 @@ class RolloutWorker:
         self.action_clip_low = self.env.action_space.low
         self.action_clip_high = self.env.action_space.high
         self.max_episode_length = max_episode_length
+
+        if self.max_episode_length is None:
+            # query the environment
+            if hasattr(self.env, "spec") and hasattr(self.env.spec, "max_episode_steps") \
+                    and self.env.spec.max_episode_steps is not None:
+                self.max_episode_length = self.env.spec.max_episode_steps
+                print("Using max episode length of ", self.max_episode_length)
+            else:
+                raise ValueError("No max_episode_steps was provided, and it could not be deduced form the environment")
+
+
         self.local_render_mode = local_render_mode
         self.eval_video_height = eval_video_height
         self.eval_video_width = eval_video_width

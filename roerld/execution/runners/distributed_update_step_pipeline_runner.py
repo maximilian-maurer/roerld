@@ -1,4 +1,5 @@
 import datetime
+import json
 import os
 import re
 import time
@@ -21,23 +22,30 @@ from roerld.execution.actors.log_replay_actor import LogReplayActor
 from roerld.execution.actors.preprocessing_actor import PreprocessingActor
 from roerld.execution.actors.rollout_actor import RolloutActor
 from roerld.execution.actors.single_instance_replay_buffer_actor import SingleInstanceReplayBufferActor
+from roerld.execution.actors.statistics_writer_actor import StatisticsWriterActor
 from roerld.execution.actors.video_writer_actor import VideoWriterActor
 from roerld.execution.control.driver_control import DriverControl
 from roerld.execution.control.ray_remote_replay_buffer import RayRemoteReplayBuffer
 from roerld.execution.control.worker_control import WorkerControl
 from roerld.execution.distributed_update_step_algorithm import DistributedUpdateStepAlgorithm
+from roerld.execution.ratios.limiter import SDLimiter
 from roerld.execution.rollouts.static_rollout_manager import StaticRolloutManager
 from roerld.execution.runners.distributed_update_step.worker_control import DistributedUpdateStepPipelineWorkerControl
 from roerld.execution.transition_format import TransitionFormat
 from roerld.execution.utils.diagnostics import aggregate_diagnostics
 from roerld.execution.utils.experience import rollout_experience_into_episodes
+from roerld.execution.utils.opportunistic_actor_pool import OpportunisticActorPool
 from roerld.execution.utils.result_reorder_buffer import ResultReorderBuffer
 from roerld.execution.utils.timings import TimingHelper
-from roerld.execution.utils.waiting import wait_all
+from roerld.execution.utils.waiting import wait_all, flatten_list_of_lists
 from roerld.learning_actors.random.random_from_action_space import RandomFromActionSpaceLearningActor
 from roerld.learning_actors.wrappers.algo_actor_wrapper import AlgoActorWrapper
 from roerld.learning_actors.wrappers.epsilon_greedy import EpsilonGreedyLearningActor
 from roerld.replay_buffers.replay_buffer import ReplayBuffer
+from roerld.statistics.csv_writer import CSVStatisticsWriter
+from roerld.statistics.statistics_writer import StatisticsWriter
+from roerld.statistics.tensorboard_statistics_writer import TensorboardStatisticsWriter
+from roerld.statistics.utility_writers import CompoundWriter, FilterWriter, BackwardsCompatibilityRenamer
 
 
 class DataSources(Enum):
@@ -77,8 +85,7 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
 
                  max_episode_length: int,
                  checkpoint_interval: int,
-                 min_bellman_update_batches_per_epoch: int,
-                 max_bellman_update_batches_per_epoch: int,
+                 update_steps_started_per_epoch_limiters: List[SDLimiter],
                  seed: int,
                  num_eval_episodes_per_epoch: int,
                  save_eval_videos: bool,
@@ -90,11 +97,17 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
                  preprocessing_workers,
                  preprocessing_chains,
 
+                 rollout_manager_factory,
+
                  experiment_config: Dict,
 
                  drop_keys: List[str] = None,
                  restore_from_checkpoint_path=None,
-                 omit_timing_data=False):
+                 omit_timing_data=False,
+                 statistics_writer_factories: List[Callable[[], StatisticsWriter]] = None,
+                 initial_bellman_update_count=50,
+                 initial_rollout_count=10
+                 ):
         """
         Issues pending refactoring:
             * There is a muddling of responsibility for the initial setup of the buffers between the algorithm
@@ -159,7 +172,8 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
             write_checkpoint_callback: A callback that is called when a checkpoint is created. It is given the
                                         directory path of the checkpoint folder.
             max_episode_length: The maximum length of an episode. If an episode has not returned done by that number of
-                                steps it is not stepped any further.
+                                steps it is not stepped any further. This may be None, in which case it will be attempted
+                                to be deduced from the environment per the rules of the :ref rollout_worker.
             checkpoint_interval: The interval at which checkpoints are created.
             min_bellman_update_batches_per_epoch: The minimum number of distributed update steps to perform per
                                                     epoch.
@@ -179,6 +193,8 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
             omit_timing_data: Whether to save timing data in the tensorboard output. While this data is useful for
                                 profiling, it will significantly bloat up the tensorboard output and cause lags, so
                                 this flag can be used to disable it.
+            initial_bellman_update_count: Amount of initial bellman update tasks to run before training starts
+            initial_rollout_count: Amount of initial rollouts to perform before training starts
         """
         self.epochs = epochs
         self.algorithm_factory = algorithm_factory
@@ -200,10 +216,13 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
         self.io_factory = io_factory
         self.preprocessing_workers = preprocessing_workers
         self.preprocessing_chains = preprocessing_chains
+        self.statistics_writer_factories = statistics_writer_factories
+        self.initial_rollout_count = initial_rollout_count
+        self.initial_bellman_update_count = initial_bellman_update_count
+        self.rollout_manager_factory = rollout_manager_factory
 
         self.checkpoint_interval = checkpoint_interval
-        self.min_bellman_update_batches_per_epoch = min_bellman_update_batches_per_epoch
-        self.max_bellman_update_batches_per_epoch = max_bellman_update_batches_per_epoch if max_bellman_update_batches_per_epoch is not None else np.inf
+        self.update_steps_started_per_epoch_limiters = update_steps_started_per_epoch_limiters
         self.seed = seed
         self.num_eval_episodes_per_epoch = num_eval_episodes_per_epoch
         self.save_eval_videos = save_eval_videos
@@ -211,15 +230,15 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
         self.eval_video_save_interval = eval_video_save_interval
         self.eval_interval = eval_interval
         self.experiment_tag = experiment_tag
+        self.max_print_epoch_interval = 60.
 
         self.experiment_config = ExperimentConfig.view(experiment_config)
 
-        assert self.max_episode_length > 0
+        assert  self.max_episode_length is None or self.max_episode_length > 0
         assert checkpoint_interval > 0
-        assert min_bellman_update_batches_per_epoch >= 0
         assert num_eval_episodes_per_epoch > 0
         assert eval_interval > 0
-        assert self.max_bellman_update_batches_per_epoch >= self.min_bellman_update_batches_per_epoch
+        assert self.initial_bellman_update_count > 0
 
         # keys set via the configuration
         self.algorithm = None
@@ -235,6 +254,10 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
             tf.random.set_seed(self.seed)
             np.random.seed(self.seed)
 
+        self.rollout_worker_seeds = np.random.randint(low=0, high=np.iinfo(np.int32).max,
+                                                      size=len(self.rollout_worker_configurations))
+        self.rollout_worker_seeds = [int(i) for i in self.rollout_worker_seeds]
+
         # For all other processes, ray will manage the gpu allocation. Since this is the driver process
         #  which may not use the GPU, forbid it manually here.
         tf.config.experimental.set_visible_devices([], 'GPU')
@@ -245,12 +268,37 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
         self.output_path = os.path.join(self.output_directory_name)
         self.experience_directory = os.path.join(self.output_path, "experience")
 
+        if self.statistics_writer_factories is None:
+            # todo this is a default set for backwards compatibility, rework this together with the base path
+            # as part of the config separation
+            print("Using default statistics writers.")
+            excluded_keys = ["Bellman Update Q1'S / Data",
+                             "Bellman Update Q2'S / Data"]
+            tensorboard_keys = [
+                "Bellman Update Q1'S / Data",
+                "Bellman Update Q2'S / Data",
+                "Episode Length / Data",
+                "Episode Return (From Environment Reward) / Data",
+                "Gradient Magnitudes / Data",
+                "Q0 Loss / Data",
+                "Bellman Updater Batches",
+                "Pipeline Stall Waiting on Rollouts",
+                "Pipeline Stall Waiting on Bellman Updates",
+                "On-Policy Rollouts",
+                "Success Rate / Data"
+            ]
+            self.statistics_writer_factories = [lambda: CompoundWriter([
+                FilterWriter(CSVStatisticsWriter(self.output_path), excluded_keys, invert=True),
+                FilterWriter(BackwardsCompatibilityRenamer(TensorboardStatisticsWriter(self.output_path)),
+                             keys_to_keep=tensorboard_keys)
+            ])]
+
         # variables which will be lazy initialized because they require parts of the pipeline to be started already
         self.transition_format = None  # type: TransitionFormat
 
         self.eval_buffer = ResultReorderBuffer()
-        self.tb_writer = None
         self.rollout_diagnostics = []
+        self.statistics_writer_actors = []
         self.distributed_update_args = None
         self.gradient_update_args = None
         self.episode_writers = None
@@ -262,7 +310,6 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
 
     def _setup(self):
         self._ensure_output_folders_exist()
-        self.tb_writer = tf.summary.create_file_writer(logdir=self.output_path)
 
         if os.path.islink("latest_run"):
             os.unlink("latest_run")
@@ -274,12 +321,14 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
             .options(**self.coordinator_worker_configuration[0]) \
             .remote(actor_setup_function=self.actor_setup_function)
 
+        self._setup_statistics_writer_actors()
+
         # At this point it is necessary to know the properties of the environment (mainly the structure of the
         # spaces). To that end there needs to be an instance of the environment. As the pipeline runner may run on a
         # different device, the rollout actors are the only actors which have placement guaranteed somewhere where
         # the environments can be constructed (e.g. all devices they need are available and connected), hence they
         # need to be constructed here before anything else is done
-        self._setup_rollout_actors(coordinator_actor=self.coordinator)
+        self.rollout_worker_reproducer_seeds = self._setup_rollout_actors(coordinator_actor=self.coordinator)
         first_rollout_actor = self.rollout_actors[0]
         observation_space = ray.get(first_rollout_actor.env_observation_space.remote())
         action_space = ray.get(first_rollout_actor.env_action_space.remote())
@@ -294,26 +343,20 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
         # The rollout manager is the only class which interacts with the environment directly, as such it needs
         #  to have buffers for all the data (the original input specification) rather than only the data retained
         #  for processing here.
-        wait_all([
+        init_futures = wait_all([
             rollout_actor.initialize.remote(
                 self._make_worker_control("rollout" + str(idx)))
             for idx, rollout_actor in enumerate(self.rollout_actors)
         ])
 
-        assert self.experiment_config.key("rollout_manager.name") == "static_rollouts"
-        self.rollout_manager = StaticRolloutManager(
-            runner=self,
-            workers=self.rollout_actors,
-            min_training_rollouts_per_epoch=self.experiment_config.key(
-                "rollout_manager.min_training_rollouts_per_epoch"),
-            max_training_rollouts_per_epoch=self.experiment_config.key(
-                "rollout_manager.max_training_rollouts_per_epoch"),
-            render_every_n_training_rollouts=self.experiment_config.key(
-                "rollout_manager.render_every_n_training_rollouts"
-            )
-        )
+        # despite the result being discarded, these have to be gotten here so as to retrieve any errors during setup
+        # that have happened (which will then throw here).
+        _ = [ray.get(f) for f in init_futures]
 
-        #
+        self.rollout_manager = self.rollout_manager_factory(self)
+        for w in self.rollout_actors:
+            self.rollout_manager.add_actor(w)
+
         if self.store_onpolicy_experience:
             self._setup_episode_writer_actors()
         else:
@@ -348,7 +391,7 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
                 print("Performing initial onpolicy buffer fill.")
                 self.rollout_manager.start_of_epoch(0, self.weights)
 
-                for _ in range(len(self.rollout_actors) * 100):
+                for _ in range(self.initial_rollout_count):
                     self.rollout_manager.manually_schedule_training_rollout(fully_random=True)
                 pending_rollout_futures = self.rollout_manager.pending_futures()
                 wait_all(pending_rollout_futures)
@@ -370,16 +413,20 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
                 print(f"Offline buffer has {samples} samples in it ({round((samples / max_buffer_size) * 100, 2)}%)")
 
         print("Populating training buffer, waiting for initial batches to be processed")
-        for i in range(50):
-            print(f"Initial Buffer Fill #{i}")
-            wait_all([worker.update_step.remote(self.distributed_update_args) for worker in self.bellman_update_actors])
+        for i in range(self.initial_bellman_update_count):
+            print(f"Initial Bellman Updates #{i}")
+            self.bellman_update_actor_pool.map_once_to_each_actor(
+                lambda w: [w.update_step.remote(self.distributed_update_args)])
+            pending = wait_all(self.bellman_update_actor_pool.all_pending_tasks())
+            for p in pending:
+                self.bellman_update_actor_pool.task_done(p)
 
     def run(self):
         self._setup()
         gradient_actor = self.gradient_actors[0]
 
-        #ray_errors = ray.errors()
-        #if len(ray_errors) > 0:
+        # ray_errors = ray.errors()
+        # if len(ray_errors) > 0:
         #    print(f"Encountered errors, shutting down: {ray_errors}")
         #    return False
 
@@ -442,6 +489,8 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
         try:
             epoch_index = 0
             task_assignments = {}
+            time_start = time.monotonic_ns()
+            last_update_time = last_status_update_time = time.time()
 
             while epoch_index <= self.epochs:
                 # print("Epoch ", epoch_index)
@@ -450,6 +499,8 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
                 self.coordinator.set_epoch.remote(epoch_index)
                 self.algorithm.start_epoch(self)
                 self.rollout_manager.start_of_epoch(epoch_index, self.weights)
+                for limiter in self.update_steps_started_per_epoch_limiters:
+                    limiter.next_step(epoch_index)
 
                 timer.time_stamp("Time Driver Queue Update")
                 gradient_update_results = []
@@ -461,7 +512,8 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
                 if self.first_epoch_with_onpolicy_data:
                     print("First Epoch with On-Policy data collection.")
                     # make sure at least a single training rollout is scheduled so as to have one to wait on
-                    self.rollout_manager.manually_schedule_training_rollout()
+                    for _ in range(self.initial_rollout_count):
+                        self.rollout_manager.manually_schedule_training_rollout()
                     pending_rollout_futures = self.rollout_manager.pending_futures()
                     wait_all(pending_rollout_futures)
                     for f in pending_rollout_futures:
@@ -479,15 +531,32 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
 
                 timer.time_stamp("Time Driver Idle Worker Assignment")
 
-                idle_bellman_update_actors = [w for w in self.bellman_update_actors if
-                                              w not in task_assignments.values()]
-                for worker in idle_bellman_update_actors:
+                this_epoch_bellman_returns = 0
+
+                def _distributed_update_start(worker):
                     future = worker.update_step.remote(self.distributed_update_args)
-                    task_assignments[future] = worker
+                    for l in self.update_steps_started_per_epoch_limiters:
+                        l.one_step_performed()
+                    return [future]
+
+                def _distributed_update_continue(_):
+                    may_we = not any([l.upper_limit_reached()
+                             for l in self.update_steps_started_per_epoch_limiters])
+                    if may_we:
+                        return True
+                    # before returning False here, consider if we have no other way of reaching the minimum limits
+                    must_we = any([not l.lower_limit_achieved() for l in self.update_steps_started_per_epoch_limiters])
+                    if must_we:
+                        return True
+                    return False
+
+                self.bellman_update_actor_pool.map_to_idle_actors(
+                    _distributed_update_start,
+                    _distributed_update_continue
+                )
 
                 timer.time_stamp("Time Driver Epoch Loop")
 
-                this_epoch_bellman_updates = 0
                 bellman_updater_diagnostics = []
                 gradient_done = False
                 gradient_actor_diagnostics = None
@@ -496,7 +565,8 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
                 rollout_stall_start = -1
                 bellman_updater_stall_start = -1
 
-                while not (gradient_done and this_epoch_bellman_updates >= self.min_bellman_update_batches_per_epoch
+                while not (gradient_done
+                           and all([l.lower_limit_achieved() for l in self.update_steps_started_per_epoch_limiters])
                            and not self.rollout_manager.needs_stall()):
                     # If the gradient is done then we are waiting on something else. Determine which it is.
                     if gradient_done:
@@ -504,22 +574,24 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
                             if had_rollout_stall is False:
                                 rollout_stall_start = time.perf_counter()
                             had_rollout_stall = True
-                        if this_epoch_bellman_updates < self.min_bellman_update_batches_per_epoch:
+                        if not all([l.lower_limit_achieved() for l in self.update_steps_started_per_epoch_limiters]):
                             if had_bellman_updater_stall is False:
                                 bellman_updater_stall_start = time.perf_counter()
                             had_bellman_updater_stall = True
 
                     pending_tasks_in_this_class = list(task_assignments.keys())
+                    pending_tasks_in_bu_pool = list(self.bellman_update_actor_pool.all_pending_tasks())
                     pending_tasks_in_rollout_manager = self.rollout_manager.pending_futures()
 
-                    ready_futures, _ = ray.wait(pending_tasks_in_this_class + pending_tasks_in_rollout_manager,
+                    ready_futures, _ = ray.wait(pending_tasks_in_this_class + pending_tasks_in_rollout_manager
+                                                + pending_tasks_in_bu_pool,
                                                 num_returns=1)
                     assert len(ready_futures) == 1
                     ready_future = ready_futures[0]
 
                     if ready_future in pending_tasks_in_rollout_manager:
                         self.rollout_manager.future_arrived(ready_future)
-                    elif task_assignments[ready_future] == gradient_actor:
+                    elif ready_future in task_assignments and task_assignments[ready_future] == gradient_actor:
                         # this is a gradient update
                         assert ready_future == gradient_future
                         gradient_done = True
@@ -528,17 +600,16 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
                         del task_assignments[gradient_future]
                     else:
                         # it is a bellman updater, give it a new task
-                        bellman_updater = task_assignments[ready_future]
+                        self.bellman_update_actor_pool.task_done(ready_future)
                         results, diagnostics = ray.get(ready_future)
                         distributed_update_results.append(results)
-                        this_epoch_bellman_updates += 1
-                        del task_assignments[ready_future]
+                        this_epoch_bellman_returns += 1
 
-                        if this_epoch_bellman_updates < self.max_bellman_update_batches_per_epoch:
-                            # todo: this over-schedules by the worker count
-                            new_future = bellman_updater.update_step.remote(self.distributed_update_args)
-                            task_assignments[new_future] = bellman_updater
-                            bellman_updater_diagnostics.append(diagnostics)
+                        self.bellman_update_actor_pool.map_to_idle_actors(
+                            _distributed_update_start,
+                            _distributed_update_continue
+                        )
+                        bellman_updater_diagnostics.append(diagnostics)
 
                 time_bellman_updater_stall = time.perf_counter() - bellman_updater_stall_start \
                     if had_bellman_updater_stall else 0
@@ -547,16 +618,13 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
                 algo_info = self.algorithm.end_epoch(gradient_update_results, distributed_update_results, self)
 
                 timer.time_stamp()
-
+                end_of_epoch_time = time.monotonic_ns()
                 diagnostics_data = [*self.rollout_diagnostics, *bellman_updater_diagnostics, gradient_actor_diagnostics]
 
                 info = {
                     **algo_info,
                     "On-Policy Rollouts": self.rollout_manager.training_rollouts_started_this_epoch,
-                    "Bellman Updater Batches": this_epoch_bellman_updates,
-
-                    # todo move this over to the algorithm info
-                    # "Bellman Updater Samples Updated": this_epoch_bellman_updates * self.bellman_update_worker_batch_size,
+                    "Bellman Updater Batches": this_epoch_bellman_returns,
                     "Pipeline Stall Waiting on Rollouts": time_rollout_stall,
                     "Pipeline Stall Waiting on Bellman Updates": time_bellman_updater_stall,
                     **timer.result(),
@@ -569,9 +637,18 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
                         k: v for k, v in info.items() if "time" not in k.lower()
                     }
 
-                with self.tb_writer.as_default():
-                    for key in info:
-                        tf.summary.scalar(key, info[key], step=epoch_index)
+                # these two are always in, regardless of whether other timing data is omitted
+                timing_info = {
+                    "Wall Time UTC": datetime.datetime.now().isoformat(),
+                    "Time": (end_of_epoch_time - time_start) / 1e9
+                }
+                info.update(timing_info)
+
+                for actor in self.statistics_writer_actors:
+                    actor.write_statistics.remote(epoch_index=epoch_index,
+                                                  source_tag="base",
+                                                  data=info,
+                                                  is_evaluation=False)
 
                 render_eval_videos_this_epoch = self.save_eval_videos and (
                         epoch_index % self.eval_video_save_interval) == 0
@@ -580,7 +657,7 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
                     eval_futures = self.rollout_manager.schedule_evaluation_rollout(
                         self.num_eval_episodes_per_epoch,
                         self.weights,
-                        {"epoch": epoch_index},
+                        {"epoch": epoch_index, **timing_info},
                         True,
                         render_eval_videos_this_epoch)
                     self.eval_buffer.associate_futures_with_epoch(eval_futures, epoch_index)
@@ -590,13 +667,30 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
 
                 epoch_index += 1
 
-                if epoch_index % 100 == 0:
+                wall_time = time.time()
+                if epoch_index % 100 == 0 \
+                        or (wall_time - last_update_time) > self.max_print_epoch_interval:
                     print(f"Epoch {epoch_index} done.")
+                    last_update_time = wall_time
+                if (wall_time - last_status_update_time) > self.max_print_epoch_interval:
+                    # print a status message
+                    #print("--\nStatus: \n")
+                    #status = {
+                    #    "Update step pool size": len(self.bellman_update_actor_pool.all_pending_tasks()),
+                    #    "Rollout pool size": len(self.rollout_manager.pending_futures()),
+                    #}
+                    #for k, v in status.items():
+                    #    print(f"{k}:\t{v}")
+                    last_status_update_time = wall_time
 
             remaining_eval_futures = self.eval_buffer.pending_futures()
+
+            print("Waiting for remaining evaluation futures.")
             ray.wait(remaining_eval_futures, num_returns=len(remaining_eval_futures))
             for f in remaining_eval_futures:
-                self._handle_eval_future(self.tb_writer, f)
+                self._handle_eval_future(f)
+
+            print("Training done.")
 
         except Exception as e:
             raise e
@@ -615,8 +709,19 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
         for actor in self.gradient_actors:
             collected_data.append(ray.get(actor.get_checkpoint_state.remote()))
         self.algorithm.checkpoint(checkpoint_dir, collected_data, self)
-
         self.write_checkpoint_callback(checkpoint_dir)
+
+        runtime_data = {
+            "random": {
+                "seeds": self.rollout_worker_seeds,
+                "reproducer_seeds": self.rollout_worker_reproducer_seeds
+            },
+            "state": {
+                "epoch": epoch
+            }
+        }
+        with open(os.path.join(checkpoint_dir, "runtime_state.json"), "w") as runtime_data_file:
+            json.dump(runtime_data, runtime_data_file, indent=4)
 
     def _make_worker_control(self, name):
         # todo this doesn't deal correctly with having more than one replay buffer actor as part of the muddled
@@ -651,16 +756,16 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
             for accepted_sources, actor, is_distributed in self.preprocessing_actors:
                 if source_as_str not in accepted_sources:
                     continue
-                
+
                 waitable_future = actor.process_episode_waitable.remote(episode, episode_metadata)
                 if is_distributed:
                     waitable_future = ray.get(waitable_future)
-                                                            
+
                 futures.append(waitable_future)
         return futures
 
     def receive_evaluation_rollout(self, evaluation_rollout_future):
-        self.rollout_diagnostics.extend(self._handle_eval_future(self.tb_writer, evaluation_rollout_future))
+        self.rollout_diagnostics.extend(self._handle_eval_future(evaluation_rollout_future))
 
     def receive_training_rollout(self, training_rollout_future):
         # store onpolicy experience and sample new one
@@ -685,7 +790,7 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
                     frames=videos[i]
                 )
 
-    def _handle_eval_future(self, tb_writer, eval_future):
+    def _handle_eval_future(self, eval_future):
         self.eval_buffer.receive_future(eval_future)
 
         diagnostic_returns = []
@@ -709,9 +814,11 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
             print(
                 f"Epoch {info['epoch']} mean return was {additional_info['Episode Return (From Environment Reward)']}")
 
-            with tb_writer.as_default():
-                for key in info:
-                    tf.summary.scalar(key, info[key], step=info["epoch"])
+            for actor in self.statistics_writer_actors:
+                actor.write_statistics.remote(epoch_index=info["epoch"],
+                                              source_tag="evaluation",
+                                              data=info,
+                                              is_evaluation=True)
 
             # send off video
             if videos is not None and self.save_eval_videos:
@@ -774,12 +881,16 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
                         max_episode_length=self.max_episode_length,
                         rollout_config=self.experiment_config.section("rollouts"),
                         actor_setup_function=self.actor_setup_function,
-                        seed=self.seed,
+                        seed=seed,
                         coordinator_actor=coordinator_actor,
                         **worker_kwargs)
-            for ray_kwargs, worker_kwargs in rollout_actor_configs
+            for (ray_kwargs, worker_kwargs), seed in zip(rollout_actor_configs, self.rollout_worker_seeds)
         ]
         # @formatter:on
+
+        seed_futures = [r.reproducer_seeds.remote() for r in self.rollout_actors]
+        ray.wait(seed_futures, num_returns=len(seed_futures))
+        return [ray.get(f) for f in seed_futures]
 
     def _setup_replay_buffer_actors(self):
         buffer_actors = {}
@@ -836,6 +947,7 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
                 **actor_kwargs)
             for i, (ray_kwargs, actor_kwargs) in enumerate(bellman_update_actor_configs)]
         # @formatter:on
+        self.bellman_update_actor_pool = OpportunisticActorPool(self.bellman_update_actors)
 
     def _setup_episode_writer_actors(self):
         episode_writer_configs = self.episode_writer_worker_configurations
@@ -1002,6 +1114,15 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
         # @formatter:on
         # check that the sources are not accidentially in the enum type here
         assert all([all([type(s) == str for s in p[0]]) for p in self.preprocessing_actors])
+
+    def _setup_statistics_writer_actors(self):
+        # todo this is pending the placement rework
+        self.statistics_writer_actors = [
+            StatisticsWriterActor
+                .options(name="Statistics Writer")
+                .remote(statistics_writer_factory=fs)
+            for fs in self.statistics_writer_factories
+        ]
 
     # endregion
 

@@ -48,11 +48,12 @@ def aggregate_diagnostics(diagnostics_data: List[Dict[str, Any]]) -> Dict[str, f
         if len(as_dict[key]) == 0:
             continue
 
-        result[_prettify_key_name(key) + "/ Mean"] = np.mean(as_dict[key])
-        result[_prettify_key_name(key) + "/ Min"] = np.min(as_dict[key])
-        result[_prettify_key_name(key) + "/ Max"] = np.max(as_dict[key])
-        result[_prettify_key_name(key) + "/ STDev"] = np.std(as_dict[key])
-        result[_prettify_key_name(key) + "/ Count"] = len(as_dict[key])
-        result[_prettify_key_name(key) + "/ Sum"] = np.sum(as_dict[key])
+        result[_prettify_key_name(key) + " / Data"] = as_dict[key]
+        result[_prettify_key_name(key) + " / Mean"] = np.mean(as_dict[key])
+        result[_prettify_key_name(key) + " / Min"] = np.min(as_dict[key])
+        result[_prettify_key_name(key) + " / Max"] = np.max(as_dict[key])
+        result[_prettify_key_name(key) + " / STDev"] = np.std(as_dict[key])
+        result[_prettify_key_name(key) + " / Count"] = len(as_dict[key])
+        result[_prettify_key_name(key) + " / Sum"] = np.sum(as_dict[key])
 
     return result

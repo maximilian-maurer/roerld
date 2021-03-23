@@ -34,7 +34,7 @@ def resolve_path(experiment_config, path_kind, categories=None):
     base_path_without_category = environment_folder
 
     if path_kind == PathKind.NewLog:
-        return os.path.join("logs", base_path_with_category)
+        return os.path.join(base_path_with_category)
     if path_kind == PathKind.NewBootstrap:
         data_root = os.path.join("../Datasets/", base_path_with_category)
         if not os.path.exists(data_root):
