@@ -15,7 +15,7 @@ class KerasModel(Model, ABC):
         self.input_spec = input_spec
         self.kwargs = kwargs
         self.model, self.input_order = self._create_network(input_spec)
-        assert all([key in input_spec for key in self.input_order])
+        #assert all([key in input_spec for key in self.input_order])
 
     @abstractmethod
     def _create_network(self, input_spec) -> Tuple[tf.keras.Model, List[Any]]:
