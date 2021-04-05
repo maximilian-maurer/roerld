@@ -91,7 +91,7 @@ class StaticRolloutManager:
         return flatten_list_of_lists(eval_futures)
 
     def manually_schedule_training_rollout(self, fully_random=False):
-        futures = self.actor_pool.map_to_idle_actors(self._start_training_rollout_function(fully_random))
+        futures = self.actor_pool.map_required_task(self._start_training_rollout_function(fully_random))
         futures_to_watch = flatten_list_of_lists(futures)
         return futures_to_watch
 
