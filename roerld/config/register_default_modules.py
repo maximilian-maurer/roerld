@@ -1,5 +1,6 @@
 import copy
 import os
+import time
 
 from roerld.config.environment_scope_handlers import _GymScopeHandler
 from roerld.config.experiment_config import ExperimentConfig, ExperimentConfigView
@@ -7,7 +8,7 @@ from roerld.config.registry import register_distributed_update_step_runner, \
     register_environment_scope_handler, make_environment, register_distributed_update_step_algorithm, \
     make_distributed_update_step_algorithm, register_model, make_model, register_bootstrapping_actor, \
     register_replay_buffer, make_replay_buffer, register_data_source, make_data_source, make_episode_preprocessor, \
-    register_episode_preprocessor
+    register_episode_preprocessor, make_bootstrapping_actor, make_exploration_actor, register_exploration_actor
 from roerld.config.resolution.worker_group_resolution import resolve_worker_groups
 from roerld.data_handling.json_driven_data_source import JsonDrivenDataSource
 from roerld.data_handling.tf_data_source import TFDataSource
@@ -16,8 +17,10 @@ from roerld.execution.ratios.absolute_limiter import AbsoluteLimiter
 from roerld.execution.ratios.moving_average_limiter import MovingAverageLimiter
 from roerld.execution.rollouts import StaticRolloutManager
 from roerld.execution.transition_format import TransitionFormat
+from roerld.learning_actors.exploration.exploration_add_gaussian import AddGaussianRandomLearningActor
 from roerld.learning_actors.random.gaussian_random import GaussianRandomLearningActor
 from roerld.learning_actors.random.random_from_action_space import RandomFromActionSpaceLearningActor
+from roerld.learning_actors.wrappers import AlgoActorWrapper, EpsilonGreedyLearningActor
 from roerld.models.cnn_with_mlp import CNNWithMLP
 from roerld.models.mlp_model import MLPModel
 from roerld.preprocessing.passthrough_preprocessor import PassthroughPreprocessor
@@ -58,6 +61,37 @@ def _register_distributed_update_step_runners():
         def _env_function():
             return make_environment(experiment_config.section("environment"))
 
+        exploration_section = ExperimentConfig.view(experiment_config).section("exploration")
+        exploration_wrapper = None
+
+        if exploration_section.has_key("epsilon") and exploration_section.has_key("scale") \
+                and not exploration_section.has_key("wrapper") and exploration_section.key("name") == "epsilon_greedy":
+
+            # backwards compatibility for the old configs that defaulted to random actions
+            print("--"*10)
+            print("Warning, using legacy exploration specification (defaulting to epsilon greedy with random actions). "
+                  "Please switch to the current and up-to date exploration specification format.")
+            print("--"*10)
+            time.sleep(10)
+            epsilon = exploration_section.key("epsilon")
+            scale = float(exploration_section.key("scale"))
+
+            def _backwards_compatibility_wrapper(local_algorithm, action_space):
+                return EpsilonGreedyLearningActor(
+                    policy_actor=local_algorithm,
+                    random_actor=RandomFromActionSpaceLearningActor(action_space=action_space,
+                                                                    scaling=scale),
+                    epsilon=epsilon
+                )
+
+            exploration_wrapper = _backwards_compatibility_wrapper
+        else:
+            wrapper = exploration_section
+
+            def _wrapper(local_algorithm, action_space):
+                return make_exploration_actor(wrapper, local_algorithm, action_space)
+            exploration_wrapper = _wrapper
+
         def _algorithm_factory():
             config = ExperimentConfig.view(experiment_config.section("algorithm"))
             return make_distributed_update_step_algorithm(config)
@@ -66,9 +100,12 @@ def _register_distributed_update_step_runners():
             assert experiment_config.key("rollout_manager.name") == "static_rollouts"
             manager = StaticRolloutManager(
                 pipeline,
-                [_make_limiter(l) for l in experiment_config.optional_key("rollout_manager.training_runs_started_limiters", [])],
-                [_make_limiter(l) for l in experiment_config.optional_key("rollout_manager.training_runs_returned_limiters", [])],
-                render_every_n_training_rollouts=experiment_config.key("rollout_manager.render_every_n_training_rollouts"))
+                [_make_limiter(l) for l in
+                 experiment_config.optional_key("rollout_manager.training_runs_started_limiters", [])],
+                [_make_limiter(l) for l in
+                 experiment_config.optional_key("rollout_manager.training_runs_returned_limiters", [])],
+                render_every_n_training_rollouts=experiment_config.key(
+                    "rollout_manager.render_every_n_training_rollouts"))
             return manager
 
         def _replay_buffer_factory_curry(config_section):
@@ -172,7 +209,8 @@ def _register_distributed_update_step_runners():
             max_episode_length=pipeline_section.optional_key("max_episode_length", None),
             checkpoint_interval=pipeline_section.key("model_save_frequency"),
             update_steps_started_per_epoch_limiters=[_make_limiter(s)
-                                                     for s in pipeline_section.optional_key("update_steps_started_per_epoch_limiters", [])],
+                                                     for s in pipeline_section.optional_key(
+                    "update_steps_started_per_epoch_limiters", [])],
             seed=experiment_config.key("general_config.seed"),
             num_eval_episodes_per_epoch=pipeline_section.key("evaluation.num_eval_episodes_per_epoch"),
             save_eval_videos=pipeline_section.key("evaluation.save_videos"),
@@ -186,8 +224,9 @@ def _register_distributed_update_step_runners():
             preprocessing_chains=chains_out,
 
             rollout_manager_factory=_rollout_manager_factory,
-            
+
             experiment_config=experiment_config,
+            exploration_wrapper=exploration_wrapper,
 
             initial_bellman_update_count=pipeline_section.key("initial_bellman_update_count"),
             initial_rollout_count=pipeline_section.key("initial_rollout_count"),
@@ -348,6 +387,41 @@ def _register_preprocessors():
     register_episode_preprocessor("subsampling_resampler", _make_subsampling_preprocessor)
 
 
+def _register_exploration_actors():
+    def _make_epsilon_greedy_exploration(config, policy_actor, action_space):
+        view = ExperimentConfig.view(config)
+        epsilon = float(view.key("epsilon"))
+
+        return EpsilonGreedyLearningActor(
+            policy_actor=policy_actor,
+            random_actor=make_exploration_actor(view.section("exploration_actor"),
+                                                policy_actor,
+                                                action_space),
+            epsilon=epsilon
+        )
+
+    register_exploration_actor("epsilon_greedy", _make_epsilon_greedy_exploration)
+
+    def _make_add_gaussian_exploration(config, policy_actor, action_space):
+        view = ExperimentConfig.view(config)
+
+        return AddGaussianRandomLearningActor(
+            policy=policy_actor,
+            action_space=action_space,
+            mean=view.key("mean"),
+            std=view.key("std")
+        )
+
+    register_exploration_actor("add_gaussian", _make_add_gaussian_exploration)
+
+    def _make_fully_random_exploration(config, policy_actor, action_space):
+        return RandomFromActionSpaceLearningActor(
+            action_space=action_space
+        )
+
+    register_exploration_actor("fully_random", _make_fully_random_exploration)
+
+
 def _register_all():
     if _register_all.did_register:
         return
@@ -360,6 +434,7 @@ def _register_all():
     _register_algorithms()
     _register_distributed_update_step_runners()
     _register_bootstrapping_actors()
+    _register_exploration_actors()
     _register_all.did_register = True
 
 

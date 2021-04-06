@@ -22,6 +22,7 @@ class _ExperimentConfigRegistry:
         self.replay_buffers = {}
         self.data_sources = {}
         self.preprocessors = {}
+        self.exploration_actors = {}
 
     def make_environment(self, environment_config: Union[ExperimentConfigView, dict], **kwargs):
         view = ExperimentConfig.view(environment_config)
@@ -88,6 +89,13 @@ class _ExperimentConfigRegistry:
             raise ValueError(f"There is no registered preprocessor with name {name}")
         return self.preprocessors[name](preprocessor_config, **kwargs)
 
+    def make_exploration_actor(self, exploration_actor_config, policy_actor: LearningActor, action_space, **kwargs):
+        view = ExperimentConfig.view(exploration_actor_config)
+        name = view.key("name")
+        if name not in self.exploration_actors:
+            raise ValueError(f"There is no registered exploration actor with name {name}")
+        return self.exploration_actors[name](exploration_actor_config, policy_actor, action_space, **kwargs)
+
     def register_distributed_update_step_runner(self, name, runner_factory: Callable[[ExperimentConfigView], Any]):
         if name in self.distributed_update_step_runners:
             raise ValueError(f"There already is a registered DistributedUpdateStepRunner with name {name}")
@@ -131,6 +139,13 @@ class _ExperimentConfigRegistry:
             raise ValueError(f"There already is a registered preprocessor with the name {name}")
         self.preprocessors[name] = preprocessor_factory
 
+    def register_exploration_actor(self, name,
+                                   exploration_actor_factory: Callable[[ExperimentConfigView, LearningActor],
+                                                                       LearningActor]):
+        if name in self.exploration_actors:
+            raise ValueError(f"There already is a registered exploration actor with the name {name}")
+        self.exploration_actors[name] = exploration_actor_factory
+
 
 # global instance
 _registry = _ExperimentConfigRegistry()
@@ -171,6 +186,10 @@ def make_episode_preprocessor(preprocessor_config, **kwargs):
     return _registry.make_episode_preprocessor(preprocessor_config, **kwargs)
 
 
+def make_exploration_actor(exploration_actor_config, policy_actor: LearningActor, action_space,  **kwargs):
+    return _registry.make_exploration_actor(exploration_actor_config, policy_actor, action_space, **kwargs)
+
+
 def register_distributed_update_step_runner(
         name,
         runner_factory: Callable[[ExperimentConfigView, ExperimentConfigView, Callable], Any]):
@@ -208,3 +227,8 @@ def register_data_source(name,
 def register_episode_preprocessor(name,
                                   preprocessor_factory: Callable[[ExperimentConfigView], StreamingEpisodePreprocessor]):
     return _registry.register_episode_preprocessor(name, preprocessor_factory)
+
+
+def register_exploration_actor(name, exploration_actor_factory: Callable[[ExperimentConfigView, LearningActor],
+                                                                         LearningActor]):
+    return _registry.register_exploration_actor(name, exploration_actor_factory)

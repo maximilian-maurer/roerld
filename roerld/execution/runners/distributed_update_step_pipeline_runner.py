@@ -11,7 +11,6 @@ import gym
 import numpy as np
 import ray
 import tensorflow as tf
-
 from roerld.config.experiment_config import ExperimentConfigError, ExperimentConfig
 from roerld.data_handling.data_source import DataSource
 from roerld.execution.actors.algo_execution_actor import AlgoExecutionActor
@@ -29,7 +28,6 @@ from roerld.execution.control.ray_remote_replay_buffer import RayRemoteReplayBuf
 from roerld.execution.control.worker_control import WorkerControl
 from roerld.execution.distributed_update_step_algorithm import DistributedUpdateStepAlgorithm
 from roerld.execution.ratios.limiter import SDLimiter
-from roerld.execution.rollouts.static_rollout_manager import StaticRolloutManager
 from roerld.execution.runners.distributed_update_step.worker_control import DistributedUpdateStepPipelineWorkerControl
 from roerld.execution.transition_format import TransitionFormat
 from roerld.execution.utils.diagnostics import aggregate_diagnostics
@@ -37,10 +35,8 @@ from roerld.execution.utils.experience import rollout_experience_into_episodes
 from roerld.execution.utils.opportunistic_actor_pool import OpportunisticActorPool
 from roerld.execution.utils.result_reorder_buffer import ResultReorderBuffer
 from roerld.execution.utils.timings import TimingHelper
-from roerld.execution.utils.waiting import wait_all, flatten_list_of_lists
-from roerld.learning_actors.random.random_from_action_space import RandomFromActionSpaceLearningActor
-from roerld.learning_actors.wrappers.algo_actor_wrapper import AlgoActorWrapper
-from roerld.learning_actors.wrappers.epsilon_greedy import EpsilonGreedyLearningActor
+from roerld.execution.utils.waiting import wait_all
+from roerld.learning_actors.wrappers import AlgoActorWrapper
 from roerld.replay_buffers.replay_buffer import ReplayBuffer
 from roerld.statistics.csv_writer import CSVStatisticsWriter
 from roerld.statistics.statistics_writer import StatisticsWriter
@@ -98,6 +94,7 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
                  preprocessing_chains,
 
                  rollout_manager_factory,
+                 exploration_wrapper,
 
                  experiment_config: Dict,
 
@@ -231,6 +228,7 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
         self.eval_interval = eval_interval
         self.experiment_tag = experiment_tag
         self.max_print_epoch_interval = 60.
+        self.exploration_wrapper = exploration_wrapper
 
         self.experiment_config = ExperimentConfig.view(experiment_config)
 
@@ -860,16 +858,11 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
         assert len(rollout_actor_configs) > 0
 
         algorithm_factory = self.algorithm_factory
-        epsilon = self.experiment_config.key("exploration.epsilon")
-        scale = self.experiment_config.key("exploration.scale")
+        exploration_wrapper = self.exploration_wrapper
 
         def _learning_actor_factory(action_space):
             algo = algorithm_factory()
-            return algo, EpsilonGreedyLearningActor(
-                policy_actor=AlgoActorWrapper(algo),
-                random_actor=RandomFromActionSpaceLearningActor(action_space=action_space, scaling=scale),
-                epsilon=epsilon
-            )
+            return algo, exploration_wrapper(AlgoActorWrapper(algo), action_space)
 
         print(f"Starting {len(rollout_actor_configs)} rollout actors.")
         # @formatter:off
