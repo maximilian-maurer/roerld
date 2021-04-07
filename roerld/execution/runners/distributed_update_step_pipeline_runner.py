@@ -103,7 +103,8 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
                  omit_timing_data=False,
                  statistics_writer_factories: List[Callable[[], StatisticsWriter]] = None,
                  initial_bellman_update_count=50,
-                 initial_rollout_count=10
+                 initial_rollout_count=10,
+                 fully_random_initial_exploration=True
                  ):
         """
         Issues pending refactoring:
@@ -229,6 +230,7 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
         self.experiment_tag = experiment_tag
         self.max_print_epoch_interval = 60.
         self.exploration_wrapper = exploration_wrapper
+        self.fully_random_initial_exploration = fully_random_initial_exploration
 
         self.experiment_config = ExperimentConfig.view(experiment_config)
 
@@ -390,7 +392,7 @@ class DistributedUpdateStepPipelineRunner(DriverControl):
                 self.rollout_manager.start_of_epoch(0, self.weights)
 
                 for _ in range(self.initial_rollout_count):
-                    self.rollout_manager.manually_schedule_training_rollout(fully_random=True)
+                    self.rollout_manager.manually_schedule_training_rollout(fully_random=self.fully_random_initial_exploration)
                 pending_rollout_futures = self.rollout_manager.pending_futures()
                 wait_all(pending_rollout_futures)
                 for idx, f in enumerate(pending_rollout_futures):

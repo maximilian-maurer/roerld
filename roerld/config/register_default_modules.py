@@ -230,6 +230,7 @@ def _register_distributed_update_step_runners():
 
             initial_bellman_update_count=pipeline_section.key("initial_bellman_update_count"),
             initial_rollout_count=pipeline_section.key("initial_rollout_count"),
+            fully_random_initial_exploration=pipeline_section.optional_key("fully_random_initial_exploration", True)
 
             **kwargs
         )
@@ -270,7 +271,7 @@ def _register_algorithms():
             max_bellman_updater_optimizer_batch_size=algorithm_section.key("max_bellman_updater_optimizer_batch_size"),
             full_prefetch=algorithm_section.optional_key("full_prefetch", False),
             clip_q_target_max=algorithm_section.optional_key("clip_q_target_max", None),
-            clip_q_target_min=algorithm_section.optional_key("clip_q_target_min", None),
+            clip_q_target_min=algorithm_section.optional_key("clip_q_target_min", None)
         )
 
         return qt_opt
