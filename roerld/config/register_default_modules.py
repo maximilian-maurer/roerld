@@ -230,7 +230,7 @@ def _register_distributed_update_step_runners():
 
             initial_bellman_update_count=pipeline_section.key("initial_bellman_update_count"),
             initial_rollout_count=pipeline_section.key("initial_rollout_count"),
-            fully_random_initial_exploration=pipeline_section.optional_key("fully_random_initial_exploration", True)
+            fully_random_initial_exploration=pipeline_section.optional_key("fully_random_initial_exploration", True),
 
             **kwargs
         )
